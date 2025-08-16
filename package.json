@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",
-    "build": "./node_modules/esbuild/bin/esbuild ./node_modules/codemirror-rich-markdoc/src/index.ts --bundle --format=esm '--external:@*' --outfile=./node_modules/codemirror-rich-markdoc/dist/index.js && next build",
+    "build": "next build",
     "start": "next start",
     "lint": "next lint"
   },

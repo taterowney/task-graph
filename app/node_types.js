@@ -2,7 +2,7 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import CodeMirror from '@uiw/react-codemirror';
 // Rich Markdown (Markdoc) plugin
-import richMarkdown from 'codemirror-rich-markdoc';
+import richMarkdown from './codemirror-rich-markdoc/index';
 import markdoc from '@markdoc/markdoc';
 import { Table } from '@lezer/markdown';
 import { languages } from '@codemirror/language-data';
