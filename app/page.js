@@ -1,7 +1,10 @@
 'use client';
 import { FlowChart } from "./components";
-import { usePersistentUserData } from "./persistence";
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { getLastAccessToken, readAppDataConfig, useGoogleDriveState } from './googleAPI';
+
+// Dev flag to toggle the debug token panel
+const DEV = false;
 
 // GRAPHING: ReactFlow
 // https://reactflow.dev/examples
@@ -17,55 +20,61 @@ import { useState, useEffect } from 'react';
 // - Autofocus new nodes' titles when created
 // - Add confirmation modal on deletion
 // - (the above 2 features introduce the same bugs when trying to implement them, and break a lot of old features)
-// - deployment
-// - Fix sidebar on mobile
-// - cloud storage
+// - sometimes hangs while loading (?)
 // - (later) GCal integration
+
+
+/* 
+Change the styling of nodes (components defined in node_types.js, may be some styling in globals.css) so that their size is scaled by 1/(2**node.depth). Make sure any hardcoded pixel / size parameters are scaled appropriately too. 
+*/
+
 
 
 export default function Home() {
   const [showCredits, setShowCredits] = useState(false);
-  const initial = {
-      "root": {
-        "title": "Root Node",
-        "children": ["12345", "67890"],
-        "type": "task",
-        "visible": true,
-        "dueDate": null,
-        "repeatDays": 0,
-      },
-      "12345": {
-          "title": "Task Node", 
-          "children": ["abcde"],
-          "type": "task",
-          "completed": false,
-          "visible": true,
-          "dueDate": null,
-          "repeatDays": 0,
-      },
-      "67890": {
-        "title": "Task Node 2", 
-        "children": [],
-        "type": "task",
-        "completed": true,
-        "visible": true,
-        "dueDate": null,
-        "repeatDays": 0,
+  const [tokenSnippet, setTokenSnippet] = useState(null);
+  const [cfgText, setCfgText] = useState(null);
+  const [cfgLoading, setCfgLoading] = useState(false);
+  const [cfgError, setCfgError] = useState(null);
+  const [driveCfg, setDriveCfg, { status: driveStatus, lastSavedAt, lastError: driveError }] = useGoogleDriveState({ text: '', layout: null });
+  const initial = useMemo(() => ({
+    "root": {
+      "title": "",
+      "children": [],
+      "type": "task",
+      "visible": true,
+      "dueDate": null,
+      "repeatDays": 0,
+  "depth": 0,
     },
-      "abcde": {
-          "title": "Text Node", 
-          "children": [],
-          "type": "text",
-          "content": "This is a text node.",
-          "visible": false,
-      }
-  };
-  const [ userData, setUserData, isLoaded ] = usePersistentUserData(initial);
+  }), []);
+  // Derive app data from Drive-backed config
+  const userData = (driveCfg && driveCfg.layout) ? driveCfg.layout : initial;
+  const isLoaded = driveStatus !== 'loading' && !!driveCfg;
+  const setUserData = useCallback((updater) => {
+    setDriveCfg(prev => {
+      const currentLayout = prev?.layout ?? initial;
+      const nextLayout = typeof updater === 'function' ? updater(currentLayout) : updater;
+      if (nextLayout === currentLayout) return prev;
+      return { ...(prev || {}), layout: nextLayout };
+    });
+  }, [setDriveCfg, initial]);
+
 
   // On load: advance any repeating task's dueDate ONLY if it is completed and overdue (past today);
   // after advancing, mark it incomplete (completed:false) so it reappears as an active task.
+  // Ensure layout is initialized after load
   useEffect(() => {
-    if (!isLoaded) return; // wait for persistence
+    if (driveStatus === 'loading') return;
+    if (!driveCfg || !driveCfg.layout || (typeof driveCfg.layout !== 'object') || Object.keys(driveCfg.layout).length === 0) {
+      setDriveCfg(prev => ({ ...(prev || {}), layout: initial }));
+    }
+  }, [driveStatus, driveCfg, setDriveCfg, initial]);
+
+  const advancedOnceRef = useRef(false);
+  useEffect(() => {
+    if (!isLoaded || advancedOnceRef.current) return; // wait for drive-backed state
+    advancedOnceRef.current = true;
     setUserData((prev) => {
       let changed = false;
       const next = { ...prev };
@@ -102,8 +111,104 @@ export default function Home() {
     });
   }, [isLoaded, setUserData]);
 
+  // Compute and assign depth for all nodes (root = 0) after load; update only when changed
+  useEffect(() => {
+    if (!isLoaded) return;
+    setUserData((prev) => {
+      if (!prev || !prev.root) return prev;
+      const targetDepth = new Map();
+      const q = ['root'];
+      targetDepth.set('root', 0);
+      while (q.length) {
+        const id = q.shift();
+        const d = targetDepth.get(id);
+        const info = prev[id];
+        const children = (info && Array.isArray(info.children)) ? info.children : [];
+        for (const cid of children) {
+          if (!prev[cid]) continue;
+          const nd = d + 1;
+          const cur = targetDepth.get(cid);
+          if (cur === undefined || nd < cur) {
+            targetDepth.set(cid, nd);
+            q.push(cid);
+          }
+        }
+      }
+      let changed = false;
+      const next = { ...prev };
+      for (const [id, node] of Object.entries(prev)) {
+        if (!node) continue;
+        if (!targetDepth.has(id)) continue; // leave unreachable nodes unchanged
+        const want = targetDepth.get(id);
+        if (node.depth !== want) {
+          next[id] = { ...node, depth: want };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [isLoaded, setUserData, userData]);
+
+  // Log loaded userData once when available
+  if (DEV) {
+    const loggedOnceRef = useRef(false);
+    useEffect(() => {
+      if (!isLoaded || loggedOnceRef.current) return;
+      loggedOnceRef.current = true;
+      try {
+        console.log('Loaded userData:', userData);
+      } catch (_) {}
+    }, [isLoaded, userData]);
+  }
+
+  // Dev-only: poll for access token and show a short snippet
+  useEffect(() => {
+    if (!DEV) return;
+    let mounted = true;
+    const toSnippet = (t) => (t ? `${t.slice(0, 12)}…${t.slice(-6)}` : null);
+    // initial
+    try {
+      const t0 = getLastAccessToken();
+      setTokenSnippet(toSnippet(t0));
+    } catch (_) {}
+    const id = setInterval(() => {
+      if (!mounted) return;
+      try {
+        const t = getLastAccessToken();
+        setTokenSnippet(toSnippet(t));
+      } catch (_) {
+        setTokenSnippet(null);
+      }
+    }, 1000);
+    return () => {
+      mounted = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  // Dev button handler: read config.json from Drive AppData
+  const handleReadConfig = async () => {
+    if (!DEV) return;
+    setCfgError(null);
+    setCfgLoading(true);
+    try {
+      const data = await readAppDataConfig();
+      if (data == null) {
+        setCfgText('null');
+      } else {
+        const s = JSON.stringify(data);
+        setCfgText(s.length > 160 ? `${s.slice(0, 160)}…` : s);
+      }
+    } catch (e) {
+      setCfgError(e?.message || 'read failed');
+    } finally {
+      setCfgLoading(false);
+    }
+  };
+
   return (
     <>
+      {/* DO NOT GET RID OF THIS RECTANGLE. IT IS IMPORTANT */}
       <div
         style={{
           position: 'fixed',
@@ -118,6 +223,86 @@ export default function Home() {
           boxSizing: 'border-box'
         }}
       >
+
+      </div>
+      {DEV && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 10,
+            right: 14,
+            maxWidth: 360,
+            minHeight: 32,
+            background: '#ffffff',
+            border: '1px solid #e2e2e2',
+            borderRadius: 6,
+            zIndex: 1200,
+            padding: '6px 8px',
+            fontSize: 12,
+            lineHeight: 1.3,
+            boxSizing: 'border-box',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)'
+          }}
+        >
+          <div style={{opacity:0.7, marginBottom:2}}>Drive token</div>
+          <code style={{wordBreak:'break-all'}}>{tokenSnippet ?? 'null'}</code>
+          <div style={{marginTop:8, borderTop:'1px solid #eee', paddingTop:6}}>
+            <div style={{opacity:0.7, marginBottom:4}}>AppData test</div>
+            <div style={{display:'flex', alignItems:'center', gap:8, flexWrap:'wrap'}}>
+              <button
+                onClick={handleReadConfig}
+                disabled={cfgLoading}
+                style={{
+                  padding:'4px 8px',
+                  fontSize:12,
+                  border:'1px solid #ddd',
+                  borderRadius:4,
+                  background: cfgLoading ? '#f7f7f7' : '#fff',
+                  cursor: cfgLoading ? 'default' : 'pointer'
+                }}
+              >
+                {cfgLoading ? 'Reading…' : 'Read config.json'}
+              </button>
+              <code style={{wordBreak:'break-all'}}>
+                {cfgError ? `Error: ${cfgError}` : (cfgText ?? '')}
+              </code>
+              <button
+                onClick={() => setUserData(() => initial)}
+                style={{
+                  padding:'4px 8px',
+                  fontSize:12,
+                  border:'1px solid #ddd',
+                  borderRadius:4,
+                  background:'#fff',
+                  cursor:'pointer'
+                }}
+                title="Reset the graph layout to the initial root-only state"
+              >
+                Reset layout to initial
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom-right save indicator */}
+      <div
+        style={{
+          position: 'fixed',
+          bottom: 38,
+          right: 14,
+          background: '#ffffff',
+          border: '1px solid #e2e2e2',
+          borderRadius: 6,
+          padding: '4px 8px',
+          fontSize: 12,
+          color: '#555',
+          zIndex: 1050,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.08)'
+        }}
+      >
+        {driveStatus === 'saving' ? 'Saving…' : (lastSavedAt ? `Saved ${new Date(lastSavedAt).toLocaleTimeString()}` : (driveStatus === 'loading' ? 'Loading…' : 'Loaded'))}
+        {driveError && <span style={{marginLeft:8, color:'#c62828'}}>Error</span>}
       </div>
 
   {/* Left Sidebar: Due & Overdue Tasks */}
@@ -125,7 +310,7 @@ export default function Home() {
 
       <FlowChart data={userData} setData={setUserData} isLoaded={isLoaded} />
 
-      {/* Credits trigger */}
+      {/* Credits + build/version number */}
       <span
         onClick={() => setShowCredits(true)}
         style={{
@@ -142,7 +327,7 @@ export default function Home() {
         tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setShowCredits(true); } }}
       >
-        Credits
+        v0.2 | Credits
       </span>
 
       {showCredits && (

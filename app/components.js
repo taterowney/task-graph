@@ -292,6 +292,7 @@ export function FlowChart({ data: userData, setData: setUserData, isLoaded = tru
       }
       pendingPositionsRef.current.set(newId, { x: newX, y: newY });
 
+      const parentDepth = (userData[parentId]?.depth ?? 0);
       const newNode = {
         title: '',
         type: 'task',
@@ -301,6 +302,7 @@ export function FlowChart({ data: userData, setData: setUserData, isLoaded = tru
   dueDate: null,
   repeatDays: 0,
         ...overrides,
+        depth: parentDepth + 1,
       };
       setUserData((prev) => ({
         ...prev,
@@ -623,6 +625,7 @@ export function FlowChart({ data: userData, setData: setUserData, isLoaded = tru
           elementsSelectable={true}
           disableKeyboardA11y={true}
           style={{ background: 'transparent', width: '100%', height: '100%' }}
+          maxZoom={10000}
         >
         </ReactFlow>
       </ReactFlowProvider>
