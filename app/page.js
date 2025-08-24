@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { getLastAccessToken, readAppDataConfig, useGoogleDriveState } from './googleAPI';
 
 // Dev flag to toggle the debug token panel
-const DEV = true;
+const DEV = false;
 const LAYOUT_KEY = DEV ? 'layout_dev' : 'layout';
 
 // GRAPHING: ReactFlow
