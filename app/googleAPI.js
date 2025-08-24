@@ -1,12 +1,14 @@
-'use client';
+"use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 
-const oauth2_client_id = "515332392313-ai7bb9n5g30jv88ic202j8slu4f18h5n.apps.googleusercontent.com"
+const oauth2_client_id =
+  "515332392313-ai7bb9n5g30jv88ic202j8slu4f18h5n.apps.googleusercontent.com";
 
 const SCOPES = "https://www.googleapis.com/auth/drive.appdata";
 
 let gisLoadedPromise = null;
 let lastAccessToken = null;
+let tokenClient = null; // GIS token client instance
 
 function loadGisScript() {
   if (gisLoadedPromise) return gisLoadedPromise;
@@ -24,31 +26,62 @@ function loadGisScript() {
   return gisLoadedPromise;
 }
 
+function ensureTokenClient() {
+  if (typeof window === "undefined") return null;
+  if (tokenClient) return tokenClient;
+  if (!window.google?.accounts?.oauth2) return null;
+  tokenClient = window.google.accounts.oauth2.initTokenClient({
+    client_id: oauth2_client_id,
+    scope: SCOPES,
+    callback: () => {
+      /* set per-request */
+    },
+  });
+  return tokenClient;
+}
+
 /**
  * Requests an OAuth 2.0 access token for Drive AppData.
  * Resolves with the access token string.
  */
-export async function requestDriveAppDataCredentials({ forcePrompt = true } = {}) {
+export async function requestDriveAppDataCredentials(
+  { prompt = "", timeoutMs = 15000, resolveNullOnTimeout } = {}
+) {
   if (typeof window === "undefined" || !oauth2_client_id) return null;
   await loadGisScript();
 
   return new Promise((resolve, reject) => {
     try {
-      const tokenClient = window.google.accounts.oauth2.initTokenClient({
-        client_id: oauth2_client_id,
-        scope: SCOPES,
-        callback: (resp) => {
-          if (resp && resp.access_token) {
-            lastAccessToken = resp.access_token;
-            resolve(resp.access_token);
-          } else {
-            reject(new Error("No access token returned."));
-          }
-        },
-      });
+      const client = ensureTokenClient();
+      if (!client) return reject(new Error("GIS not available"));
 
-      // Prompt the user on page load to ensure consent (as requested).
-      tokenClient.requestAccessToken({ prompt: forcePrompt ? "consent" : "" });
+      let settled = false;
+      const to = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        // For silent attempts it's safe to treat timeout as "no token available".
+        const silent = prompt === "";
+        const allowNull = resolveNullOnTimeout ?? silent;
+        if (allowNull) return resolve(null);
+        reject(new Error("token_timeout"));
+      }, Math.max(1000, timeoutMs | 0));
+
+      client.callback = (resp) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(to);
+        if (resp && resp.access_token) {
+          lastAccessToken = resp.access_token;
+          resolve(resp.access_token);
+        } else {
+          const err = new Error(resp?.error || "token_failed");
+          err.details = resp;
+          reject(err);
+        }
+      };
+
+  // Request: prompt "" for silent, "consent" for interactive
+      client.requestAccessToken({ prompt });
     } catch (err) {
       reject(err);
     }
@@ -63,11 +96,8 @@ export function setupGoogleDriveAppDataAuthOnLoad() {
   window.addEventListener(
     "load",
     () => {
-      // Force prompt on first load to get explicit consent for Drive AppData.
-      requestDriveAppDataCredentials({ forcePrompt: true }).catch((e) => {
-        // Optional: handle or report the error
-        console.error(e);
-      });
+  // Try silent on load; ignore failures/timeouts to avoid noisy logs.
+  requestDriveAppDataCredentials({ prompt: "" }).catch(() => {});
     },
     { once: true }
   );
@@ -84,26 +114,67 @@ export function getLastAccessToken() {
 }
 
 // Ensure we have a token; try silent retrieval before prompting.
-async function ensureAccessToken({ forcePrompt = false } = {}) {
+async function ensureAccessToken({ interactive = false } = {}) {
   if (lastAccessToken) return lastAccessToken;
-  const token = await requestDriveAppDataCredentials({ forcePrompt });
-  return token;
+  try {
+  const token = await requestDriveAppDataCredentials({ prompt: "" });
+  if (token) return token;
+  if (!interactive) throw new Error("no_token");
+  return await requestDriveAppDataCredentials({ prompt: "consent" });
+  } catch (e) {
+    if (!interactive) throw e;
+    return await requestDriveAppDataCredentials({ prompt: "consent" });
+  }
 }
 
 // Small fetch helper that injects Authorization header and retries once on 401 by refreshing the token silently.
-async function fetchWithDriveToken(input, init = {}, { retryOn401 = true } = {}) {
-  const token = await ensureAccessToken({ forcePrompt: false });
+async function fetchWithDriveToken(
+  input,
+  init = {},
+  {
+    retryOnAuth = true,
+    interactiveOnAuthFail = false,
+    timeoutMs = 15000,
+  } = {}
+) {
+  // Ensure token (silent first)
+  const token = await ensureAccessToken({ interactive: false });
   const headers = new Headers(init.headers || {});
-  if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
-  const res = await fetch(input, { ...init, headers });
-  if (res.status === 401 && retryOn401) {
-    // Attempt to refresh token silently and retry once
-    await requestDriveAppDataCredentials({ forcePrompt: false });
-    const headers2 = new Headers(init.headers || {});
-    if (!headers2.has('Authorization')) headers2.set('Authorization', `Bearer ${lastAccessToken}`);
-    return fetch(input, { ...init, headers: headers2 });
+  if (!headers.has("Authorization")) headers.set("Authorization", `Bearer ${token}`);
+
+  // Install timeout via AbortController
+  const ac = new AbortController();
+  const userSignal = init.signal;
+  const onUserAbort = () => ac.abort(userSignal.reason || "aborted");
+  if (userSignal) {
+    if (userSignal.aborted) ac.abort(userSignal.reason || "aborted");
+    else userSignal.addEventListener("abort", onUserAbort, { once: true });
   }
-  return res;
+  const to = setTimeout(() => ac.abort("timeout"), Math.max(2000, timeoutMs | 0));
+
+  try {
+    let res = await fetch(input, { ...init, headers, signal: ac.signal });
+    if ((res.status === 401 || res.status === 403) && retryOnAuth) {
+      // clear token and optionally attempt interactive
+      lastAccessToken = null;
+      try {
+        await ensureAccessToken({ interactive: interactiveOnAuthFail });
+      } catch (_) {
+        // if we can't get a token, throw original response
+        const err = new Error("unauthorized");
+        err.status = res.status;
+        throw err;
+      }
+      const headers2 = new Headers(init.headers || {});
+      if (!headers2.has("Authorization"))
+        headers2.set("Authorization", `Bearer ${lastAccessToken}`);
+      res = await fetch(input, { ...init, headers: headers2, signal: ac.signal });
+    }
+    return res;
+  } finally {
+    clearTimeout(to);
+    if (userSignal) userSignal.removeEventListener("abort", onUserAbort);
+  }
 }
 
 /**
@@ -113,24 +184,37 @@ async function fetchWithDriveToken(input, init = {}, { retryOn401 = true } = {})
 export async function readAppDataConfig() {
   if (typeof window === 'undefined') return null;
   try {
+    // Timeout/abort protection
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort('read_timeout'), 15000);
     // 1) Find file by name in appDataFolder
     const q = "name = 'config.json' and trashed = false";
     const base = 'https://www.googleapis.com/drive/v3/files';
     const url = `${base}?spaces=appDataFolder&q=${encodeURIComponent(q)}&fields=files(id,name,modifiedTime,size)`;
-    let res = await fetchWithDriveToken(url, { method: 'GET' });
+    let res = await fetchWithDriveToken(
+      url,
+      { method: 'GET', signal: ac.signal },
+      { timeoutMs: 15000, retryOnAuth: true, interactiveOnAuthFail: false }
+    );
     if (!res.ok) {
       // If unauthorized or other fatal error, return null
+      clearTimeout(to);
       return null;
     }
     const list = await res.json();
     const file = (list.files && list.files[0]) || null;
-    if (!file || !file.id) return null; // not found
+    if (!file || !file.id) { clearTimeout(to); return null; } // not found
 
     // 2) Download content
     const downloadUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}?alt=media`;
-    res = await fetchWithDriveToken(downloadUrl, { method: 'GET' });
-    if (!res.ok) return null;
+    res = await fetchWithDriveToken(
+      downloadUrl,
+      { method: 'GET', signal: ac.signal },
+      { timeoutMs: 15000, retryOnAuth: true, interactiveOnAuthFail: false }
+    );
+    if (!res.ok) { clearTimeout(to); return null; }
     const text = await res.text();
+    clearTimeout(to);
     try {
       return JSON.parse(text);
     } catch (_) {
@@ -152,12 +236,18 @@ export async function writeAppDataConfig(data) {
   try {
     // Ensure JSON string
     const content = JSON.stringify(data ?? {});
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort('write_timeout'), 15000);
 
     // 1) See if the file already exists
     const q = "name = 'config.json' and trashed = false";
     const base = 'https://www.googleapis.com/drive/v3/files';
     const listUrl = `${base}?spaces=appDataFolder&q=${encodeURIComponent(q)}&fields=files(id,name)`;
-    let res = await fetchWithDriveToken(listUrl, { method: 'GET' });
+    let res = await fetchWithDriveToken(
+      listUrl,
+      { method: 'GET', signal: ac.signal },
+      { timeoutMs: 15000, retryOnAuth: true, interactiveOnAuthFail: true }
+    );
     if (!res.ok) return null;
     const list = await res.json();
     const existing = (list.files && list.files[0]) || null;
@@ -165,12 +255,18 @@ export async function writeAppDataConfig(data) {
     // 2a) Update existing via media upload
     if (existing && existing.id) {
       const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(existing.id)}?uploadType=media&fields=id,name,modifiedTime,size`;
-      res = await fetchWithDriveToken(updateUrl, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json; charset=UTF-8' },
-        body: content
-      });
+      res = await fetchWithDriveToken(
+        updateUrl,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+          body: content,
+          signal: ac.signal,
+        },
+        { timeoutMs: 15000, retryOnAuth: true, interactiveOnAuthFail: true }
+      );
       if (!res.ok) return null;
+      clearTimeout(to);
       return await res.json();
     }
 
@@ -191,12 +287,18 @@ export async function writeAppDataConfig(data) {
     ].join('\r\n');
 
     const createUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,size';
-    res = await fetchWithDriveToken(createUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
-      body: multipartBody
-    });
+    res = await fetchWithDriveToken(
+      createUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+        body: multipartBody,
+        signal: ac.signal,
+      },
+      { timeoutMs: 15000, retryOnAuth: true, interactiveOnAuthFail: true }
+    );
     if (!res.ok) return null;
+    clearTimeout(to);
     return await res.json();
   } catch (e) {
     return null;
@@ -241,6 +343,8 @@ export function useGoogleDriveState(initialValue, options = {}) {
   // Initial load from Drive
   useEffect(() => {
     let cancelled = false;
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort('initial_load_timeout'), 15000);
     (async () => {
       try {
         const data = await readAppDataConfig();
@@ -249,12 +353,15 @@ export function useGoogleDriveState(initialValue, options = {}) {
           _setState(data);
           latestRef.current = data;
         }
+        loadedRef.current = true;
+        if (mountedRef.current) setStatus('idle');
       } catch (e) {
         lastErrorRef.current = e;
         if (onLoadError) onLoadError(e);
-      } finally {
         loadedRef.current = true;
-        if (mountedRef.current) setStatus('idle');
+        if (mountedRef.current) setStatus('error');
+      } finally {
+        clearTimeout(to);
         // If changes were queued during loading, schedule a save now
         if (saveRequestedWhileLoadingRef.current && autoSave) {
           saveRequestedWhileLoadingRef.current = false;
@@ -264,8 +371,10 @@ export function useGoogleDriveState(initialValue, options = {}) {
     })();
     return () => {
       cancelled = true;
+      ac.abort();
+      clearTimeout(to);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const performSave = useCallback(async () => {

@@ -4,7 +4,8 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { getLastAccessToken, readAppDataConfig, useGoogleDriveState } from './googleAPI';
 
 // Dev flag to toggle the debug token panel
-const DEV = false;
+const DEV = true;
+const LAYOUT_KEY = DEV ? 'layout_dev' : 'layout';
 
 // GRAPHING: ReactFlow
 // https://reactflow.dev/examples
@@ -20,7 +21,9 @@ const DEV = false;
 // - Autofocus new nodes' titles when created
 // - Add confirmation modal on deletion
 // - (the above 2 features introduce the same bugs when trying to implement them, and break a lot of old features)
-// - sometimes hangs while loading (?)
+// - sometimes hangs while loading (on first load?)
+// - Colors on iphone
+// - Mobile sizing, make sidebar un-zoomable
 // - (later) GCal integration
 
 
@@ -36,7 +39,7 @@ export default function Home() {
   const [cfgText, setCfgText] = useState(null);
   const [cfgLoading, setCfgLoading] = useState(false);
   const [cfgError, setCfgError] = useState(null);
-  const [driveCfg, setDriveCfg, { status: driveStatus, lastSavedAt, lastError: driveError }] = useGoogleDriveState({ text: '', layout: null });
+  const [driveCfg, setDriveCfg, { status: driveStatus, lastSavedAt, lastError: driveError }] = useGoogleDriveState({ text: '', layout: null, layout_dev: null });
   const initial = useMemo(() => ({
     "root": {
       "title": "",
@@ -49,14 +52,14 @@ export default function Home() {
     },
   }), []);
   // Derive app data from Drive-backed config
-  const userData = (driveCfg && driveCfg.layout) ? driveCfg.layout : initial;
+  const userData = (driveCfg && driveCfg[LAYOUT_KEY]) ? driveCfg[LAYOUT_KEY] : initial;
   const isLoaded = driveStatus !== 'loading' && !!driveCfg;
   const setUserData = useCallback((updater) => {
     setDriveCfg(prev => {
-      const currentLayout = prev?.layout ?? initial;
+      const currentLayout = (prev && prev[LAYOUT_KEY]) ?? initial;
       const nextLayout = typeof updater === 'function' ? updater(currentLayout) : updater;
       if (nextLayout === currentLayout) return prev;
-      return { ...(prev || {}), layout: nextLayout };
+      return { ...(prev || {}), [LAYOUT_KEY]: nextLayout };
     });
   }, [setDriveCfg, initial]);
 
@@ -66,8 +69,9 @@ export default function Home() {
   // Ensure layout is initialized after load
   useEffect(() => {
     if (driveStatus === 'loading') return;
-    if (!driveCfg || !driveCfg.layout || (typeof driveCfg.layout !== 'object') || Object.keys(driveCfg.layout).length === 0) {
-      setDriveCfg(prev => ({ ...(prev || {}), layout: initial }));
+    const current = driveCfg && driveCfg[LAYOUT_KEY];
+    if (!current || (typeof current !== 'object') || Object.keys(current).length === 0) {
+      setDriveCfg(prev => ({ ...(prev || {}), [LAYOUT_KEY]: initial }));
     }
   }, [driveStatus, driveCfg, setDriveCfg, initial]);
 
@@ -327,7 +331,7 @@ export default function Home() {
         tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setShowCredits(true); } }}
       >
-        v0.2 | Credits
+        v0.2.1 | Credits
       </span>
 
       {showCredits && (
